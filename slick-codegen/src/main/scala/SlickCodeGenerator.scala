@@ -1,26 +1,66 @@
-import scala.slick.model.codegen.SourceCodeGenerator
-import scala.slick.model.Model
-import scala.slick.driver.H2Driver
+import slick.codegen.SourceCodeGenerator
+import slick.model.Model
 
-object SlickCodeGenerator extends App{
-  val jdbcDriver = "org.h2.Driver"
-  val slickProfile = scala.slick.driver.H2Driver
-  val url = s"jdbc:h2:mem:slick_codegen;init=runscript from 'conf/schema.sql'"
+//object SlickCodeGenerator extends App{
+//class SlickCodeGenerator extends App{
+//  val driver = "org.h2.Driver"
+//  val url = s"jdbc:h2:mem:slick_codegen;init=runscript from 'conf/schema.sql'"
+//  val folder = new File("app/models/auto_generated")
+//  val pkg = "models.auto_generated"
+//  val tableMappingPlural: Map[String, String] = Map( "COMPANY" => "Companies" )
 
-  val db = slickProfile.simple.Database.forURL(url,driver=jdbcDriver)
-
+object SlickCodeGenerator {
   import java.io.File
-  val path = new File("app/models/auto_generated")
-  scala.util.Try(path.listFiles().filter(_.getName.endsWith(".scala")) foreach { _.delete() })
-  
+  import scala.concurrent.ExecutionContext
+
+  def apply(driver: String, url: String, pkg: String, folder: java.io.File): SlickCodeGenerator = {
+    new wrapper(driver, url, pkg, folder, Map.empty[String, String], ExecutionContext.global)
+  }
+  def apply(driver: String, url: String, pkg: String): SlickCodeGenerator = {
+    val path = pkg.replaceAll(raw"\.", "/")
+    new wrapper(driver, url, pkg, new File(s"src/main/scala/${path}"), Map.empty[String, String], ExecutionContext.global)
+  }
+  private class wrapper(val driver: String,
+                        val url: String,
+                        val pkg: String,
+                        val folder: File,
+                        val tablePlurals: Map[String, String],
+                        val ec: ExecutionContext) extends SlickCodeGenerator
+}
+trait SlickCodeGenerator {
+  /** JDBC driver */
+  val driver: String
+  /** JDBC URL string */
+  val url: String
+  /** Package name */
+  val pkg: String
+  /** Path where generated files must be written to */
+  val folder: java.io.File
+  /** Mapping between database tables and corresponding collection names. */
+  val tablePlurals: Map[String, String]
+  /** ExecutionContext for IO-bound operations */
+  val ec: scala.concurrent.ExecutionContext
+
+  private val db = slick.jdbc.JdbcBackend.Database.forURL(url, driver)
+  scala.util.Try(folder.listFiles().filter(_.getName.endsWith(".scala")) foreach { _.delete() })
+
   class SlickCodeGenerator(val model: Model) extends SourceCodeGenerator(model: Model){ gen =>
-    override def tableName = _ match {
-      case "COMPANY" => "Companies"
-      case n => n.toCamelCase+"s"
+    def pluralMapping(mappings: Map[String, String]): PartialFunction[String, String] = {
+      case s: String if mappings.isDefinedAt(s) => mappings.apply(s)
     }
-    override def entityName = _.toCamelCase
-    override def packageCode(profile: String, pkg: String, container:String) = code
-    override def code = {
+    def pluralDefault: PartialFunction[String, String] = {
+      case s: String => s.toCamelCase
+    }
+    def pluralIdentity: PartialFunction[String, String] = {
+      case s: String => s
+    }
+
+    val tableMapping = (if(tablePlurals.isEmpty) pluralDefault else pluralMapping(tablePlurals)) orElse pluralIdentity
+
+    override def tableName: String => String = tableMapping(_)
+    override def entityName: String => String = _.toCamelCase
+    override def packageCode(profile: String, pkg: String, container:String, parentType: Option[String]): String = code
+    override def code: String = {
       s"""
 package models.auto_generated
 import play.api.db.slick.Config.driver.simple._
@@ -71,9 +111,9 @@ def tinyDescription = ${dataColumns.head.name}
       }
       override def ForeignKey = new ForeignKey(_){
         override def code = {
-          val fkColumns = compound(referencingColumns.map(_.name))
+          val fkColumns = compoundValue(referencingColumns.map(_.name))
           val pkTable = tableName(referencedTable.model.name.table)
-          val pkColumns = compound(referencedColumns.map(c => s"r.${c.name}"))
+          val pkColumns = compoundValue(referencedColumns.map(c => s"r.${c.name}"))
           s"""lazy val $name = foreignKey("$dbName", $fkColumns, TableQuery[$pkTable])(r => $pkColumns, onUpdate=${onUpdate}, onDelete=${onDelete})"""
         }
       }
@@ -84,11 +124,11 @@ def ${c.name}(implicit handler: FieldConstructor, lang: Lang) = inputText(playFo
         def formField(c: Column) = {
           val rawFieldType = c.rawType match {
             case "Int" => "number"
-            case "String" if (c.fakeNullable || c.model.nullable) => "text"
+            case "String" if (c.asOption || c.model.nullable) => "text"
             case "String" => "nonEmptyText"
             case "java.sql.Date" => """sqlDate("yyyy-MM-dd")"""
           }
-          val fieldType = if (c.fakeNullable || c.model.nullable) s"optional($rawFieldType)" else rawFieldType
+          val fieldType = if (c.asOption || c.model.nullable) s"optional($rawFieldType)" else rawFieldType
           s"""
 "${c.name}" -> $fieldType
           """.trim
@@ -194,12 +234,40 @@ case class ${E}Form(playForm: Form[$E]) extends ModelForm[$E]{
       }
     }
   }
-  val codegen = new SlickCodeGenerator(db.withSession(s => H2Driver.createModel(s)))
-  codegen.writeToFile(
-    "scala.slick.driver.H2Driver",
-    "app",
-    "models.auto_generated",
-    "Models",
-    "Models.scala"
-  )
+
+
+  val RegexDB2       = "^jdbc:db2:.*".r
+  val RegexDerby     = "^jdbc:derby:.*".r
+  val RegexH2        = "^jdbc:h2:.*".r
+  val RegexHsqlDB    = "^jdbc:hsqldb:.*".r
+  val RegexSqlServer = "^jdbc:sqlserver:.*".r
+  val RegexMySQL     = "^jdbc:mysql:.*".r
+  val RegexOracle    = "^jdbc:oracle:.*".r
+  val RegexPostgres  = "^jdbc:postgresql:.*".r
+  val RegexSQLite    = "^jdbc:sqlite:.*".r
+
+  implicit val ctx = ec
+
+  import slick.jdbc.{DB2Profile, DerbyProfile, H2Profile, HsqldbProfile, SQLServerProfile, MySQLProfile, OracleProfile, PostgresProfile, SQLiteProfile}
+  val (profile, modelAction) = url match {
+    case RegexDB2(_)       => ("org.slick.driver.DB2Driver",       DB2Profile      .createModel(Some(DB2Profile      .defaultTables)))
+    case RegexDerby(_)     => ("org.slick.driver.DerbyDriver",     DerbyProfile    .createModel(Some(DerbyProfile    .defaultTables)))
+    case RegexH2(_)        => ("org.slick.driver.H2Driver",        H2Profile       .createModel(Some(H2Profile       .defaultTables)))
+    case RegexHsqlDB(_)    => ("org.slick.driver.HsqldbDriver",    HsqldbProfile   .createModel(Some(HsqldbProfile   .defaultTables)))
+    case RegexSqlServer(_) => ("org.slick.driver.SQLServerDriver", SQLServerProfile.createModel(Some(SQLServerProfile.defaultTables)))
+    case RegexMySQL(_)     => ("org.slick.driver.MySQLDriver",     MySQLProfile    .createModel(Some(MySQLProfile    .defaultTables)))
+    case RegexOracle(_)    => ("org.slick.driver.OracleDriver",    OracleProfile   .createModel(Some(OracleProfile   .defaultTables)))
+    case RegexPostgres(_)  => ("org.slick.driver.PostgresDriver",  PostgresProfile .createModel(Some(PostgresProfile .defaultTables)))
+    case RegexSQLite(_)    => ("org.slick.driver.SQLiteDriver",    SQLiteProfile   .createModel(Some(SQLiteProfile   .defaultTables)))
+  }
+
+  val modelFuture = db.run(modelAction)
+  val codegenFuture = modelFuture.map(model => new SlickCodeGenerator(model))
+
+  import scala.util.{Success, Failure}
+  codegenFuture.onComplete {
+    case Success(codegen) =>
+      codegen.writeToFile(profile, folder.getCanonicalPath, pkg,"Models","Models.scala")
+    case Failure(_) =>
+  }
 }
